@@ -2,6 +2,11 @@
 //! Raw mouse motion drives the virtual right stick; `F5` switches between
 //! On-Foot and Driving layouts; `F6` (or `Esc` while captured) releases or
 //! recaptures the mouse cursor. Switching windows releases the cursor cleanly.
+//!
+//! Native keyboard and mouse (`VICTORY_NATIVE_INPUT=1`, [`super::native`])
+//! takes the mouse the same way, but keys stay the title's: `Esc` pauses and
+//! keeps the mouse, `Left Alt` or a Windows key lets it go, a click takes it
+//! back. [`read_native`] hands the buttons, wheel and raw motion over.
 
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -11,7 +16,7 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_F5, VK_F6, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
+    GetAsyncKeyState, VK_F5, VK_F6, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2,
 };
 use windows_sys::Win32::UI::Input::{
     GetRawInputData, MOUSE_MOVE_ABSOLUTE, MOUSE_VIRTUAL_DESKTOP, RAWINPUT, RAWINPUTDEVICE,
@@ -20,19 +25,29 @@ use windows_sys::Win32::UI::Input::{
 use windows_sys::Win32::UI::WindowsAndMessaging as wm;
 use windows_sys::core::w;
 
+use super::native::{self, FrameLook, NativeMouse};
 use super::{
     KeyState, LEFT_SHOULDER, PadState, RIGHT_SHOULDER, RIGHT_STICK, lock, merged, pc_keyboard,
 };
 
-pub(super) fn enabled() -> bool {
+/// `VICTORY_PC_CONTROLS=1`: the keyboard and mouse drive the stand-in pad
+/// by the PC layout ([`pc_keyboard`]).
+pub(super) fn pc_controls() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("VICTORY_PC_CONTROLS").is_some_and(|s| s == "1"))
 }
 
-/// Mouse look sensitivity multiplier (`VICTORY_MOUSE_SENS`, default `1.0`).
-fn sensitivity() -> f32 {
+/// The title's window takes the mouse: PC controls or native input.
+pub(super) fn enabled() -> bool {
+    pc_controls() || native::enabled()
+}
+
+/// Mouse look sensitivity multiplier (`VICTORY_MOUSE_SENSITIVITY`, or
+/// `VICTORY_MOUSE_SENS`; default `1.0`).
+pub(super) fn sensitivity() -> f32 {
     static SCALE: LazyLock<f32> = LazyLock::new(|| {
-        std::env::var("VICTORY_MOUSE_SENS")
+        std::env::var("VICTORY_MOUSE_SENSITIVITY")
+            .or_else(|_| std::env::var("VICTORY_MOUSE_SENS"))
             .ok()
             .and_then(|s| s.trim().parse::<f32>().ok())
             .filter(|v| v.is_finite() && *v > 0.0)
@@ -109,6 +124,11 @@ struct Capture {
     absolute: Option<(usize, i32, i32)>,
     blocked: u8,
     last_flags: usize,
+    /// Native input: camera look, raw motion (down positive) and wheel
+    /// notches (up positive) since the last [`read_native`].
+    look: FrameLook,
+    raw: [f32; 2],
+    wheel: i32,
 }
 
 static CAPTURE: LazyLock<Mutex<Capture>> = LazyLock::new(|| Mutex::new(Capture::default()));
@@ -155,13 +175,14 @@ pub(in crate::modules) fn install(hwnd: HWND) {
     acquire(hwnd);
 }
 
+/// Buttons held: bits left, right, middle, 4, 5.
 fn mouse_buttons() -> u8 {
     // SAFETY: queries of physical mouse button state.
-    unsafe {
-        u8::from(GetAsyncKeyState(VK_LBUTTON.into()) < 0)
-            | (u8::from(GetAsyncKeyState(VK_RBUTTON.into()) < 0) << 1)
-            | (u8::from(GetAsyncKeyState(VK_MBUTTON.into()) < 0) << 2)
-    }
+    let down = |vk: u16| unsafe { GetAsyncKeyState(vk.into()) } < 0;
+    [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2]
+        .into_iter()
+        .enumerate()
+        .fold(0, |bits, (i, vk)| bits | (u8::from(down(vk)) << i))
 }
 
 fn clip_to_client(hwnd: HWND) -> Option<RECT> {
@@ -276,6 +297,23 @@ fn raw_motion(hwnd: HWND, handle: LPARAM) -> bool {
     }
     // SAFETY: the header selects the mouse member.
     let mouse = unsafe { packet.data.mouse };
+    const RI_MOUSE_WHEEL: u16 = 0x0400;
+    // SAFETY: plain integers in both members of the union.
+    let (flags, data) = unsafe {
+        (
+            mouse.Anonymous.Anonymous.usButtonFlags,
+            mouse.Anonymous.Anonymous.usButtonData,
+        )
+    };
+    if flags & RI_MOUSE_WHEEL != 0 {
+        let delta = data as i16;
+        // A notch is 120; a free-spinning wheel may report less.
+        state.wheel += if delta.abs() >= 120 {
+            i32::from(delta / 120)
+        } else {
+            i32::from(delta.signum())
+        };
+    }
     let (x, y) = (mouse.lLastX, mouse.lLastY);
     let (dx, dy) = if mouse.usFlags & MOUSE_MOVE_ABSOLUTE == 0 {
         state.absolute = None;
@@ -304,7 +342,25 @@ fn raw_motion(hwnd: HWND, handle: LPARAM) -> bool {
         }
     };
     state.motion.add(dx, dy, Instant::now());
+    state.raw[0] += dx;
+    state.raw[1] += dy;
     true
+}
+
+/// Whether a key press lets the mouse go: `Esc` with PC controls; in native
+/// mode `Esc` pauses the title and keeps the mouse, while `Left Alt` or a
+/// Windows key lets it go. Repeats do not count.
+fn lets_go(msg: u32, wp: WPARAM, lp: LPARAM, native: bool) -> bool {
+    if lp & (1 << 30) != 0 {
+        return false;
+    }
+    let extended = lp & (1 << 24) != 0;
+    match (msg, wp) {
+        (wm::WM_KEYDOWN, 0x1B) => !native,
+        (wm::WM_SYSKEYDOWN, 0x12) => native && !extended,
+        (wm::WM_KEYDOWN | wm::WM_SYSKEYDOWN, 0x5B | 0x5C) => native,
+        _ => false,
+    }
 }
 
 pub(in crate::modules) fn window_message(
@@ -347,14 +403,20 @@ pub(in crate::modules) fn window_message(
                 state.clip = clip_to_client(hwnd).or(state.clip);
             }
         }
-        wm::WM_KEYDOWN if wp == 0x1B && lp & (1 << 30) == 0 => {
-            // Esc pauses via GameInput and releases mouse capture cleanly.
+        wm::WM_KEYDOWN | wm::WM_SYSKEYDOWN if lets_go(msg, wp, lp, native::enabled()) => {
+            // The title still gets the key (Esc pauses it via GameInput).
             if WANTED.swap(false, Relaxed) {
                 release(hwnd);
-                tracing::info!(captured = false, "mouse look capture released on Esc");
+                tracing::info!(captured = false, key = wp, "mouse look capture released");
             }
         }
-        wm::WM_KEYDOWN if wp == usize::from(b'F') && lp & (1 << 30) == 0 && auto_drive() => {
+        // F and F5 switch the PC layout; native keys have none.
+        wm::WM_KEYDOWN
+            if wp == usize::from(b'F')
+                && lp & (1 << 30) == 0
+                && auto_drive()
+                && pc_controls() =>
+        {
             // F enters / leaves a vehicle: W/S follow (throttle and brake in
             // a car, the stick on foot). The game still gets F; F5 resyncs
             // if F was pressed with no vehicle near.
@@ -369,7 +431,7 @@ pub(in crate::modules) fn window_message(
                 }
             }
         }
-        wm::WM_KEYDOWN if wp == usize::from(VK_F5) => {
+        wm::WM_KEYDOWN if wp == usize::from(VK_F5) && pc_controls() => {
             if lp & (1 << 30) == 0 {
                 let was_driving = DRIVING.fetch_xor(true, Relaxed);
                 let driving = !was_driving;
@@ -465,9 +527,56 @@ pub(super) fn read(keys: &[KeyState]) -> PadState {
     pad
 }
 
+/// Native input: what the mouse did since the last call, all zero while
+/// the title's window does not have it. The context flags are left unset.
+pub(super) fn read_native() -> NativeMouse {
+    let mut state = lock(&CAPTURE);
+    let window = state.window as HWND;
+    // SAFETY: only the focused title receives physical mouse inputs.
+    if window.is_null() || unsafe { wm::GetForegroundWindow() } != window {
+        return NativeMouse::default();
+    }
+    let held = mouse_buttons();
+    state.blocked &= held;
+    let pressed = held & !state.blocked;
+    // Whole counts; the rest waits for the next call.
+    let whole = state.raw.map(f32::trunc);
+    state.raw = [state.raw[0] - whole[0], state.raw[1] - whole[1]];
+    let raw = (whole[0] as i32, whole[1] as i32);
+    let wheel = std::mem::take(&mut state.wheel);
+    let (frame, dt) = native::pad_frame();
+    let look = (raw.0, if invert_y() { -raw.1 } else { raw.1 });
+    let stick = state.look.step(super::now(), frame, dt, look, sensitivity());
+    NativeMouse {
+        buttons: [0x01, 0x02, 0x04, 0x05, 0x06]
+            .into_iter()
+            .enumerate()
+            .filter(|&(i, _)| pressed & (1 << i) != 0)
+            .map(|(_, vk)| vk)
+            .collect(),
+        stick,
+        raw,
+        wheel,
+        ..NativeMouse::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn esc_lets_go_with_pc_controls_and_alt_or_win_in_native_mode() {
+        let (down, sys, again, right) = (wm::WM_KEYDOWN, wm::WM_SYSKEYDOWN, 1 << 30, 1 << 24);
+        assert!(lets_go(down, 0x1B, 0, false));
+        assert!(!lets_go(down, 0x1B, 0, true));
+        assert!(!lets_go(down, 0x1B, again, false));
+        assert!(lets_go(sys, 0x12, 0, true));
+        assert!(!lets_go(sys, 0x12, right, true));
+        assert!(!lets_go(sys, 0x12, 0, false));
+        assert!(lets_go(down, 0x5B, 0, true) && lets_go(sys, 0x5C, 0, true));
+        assert!(!lets_go(down, 0x41, 0, true));
+    }
 
     #[test]
     fn both_mouse_buttons_work_together_in_both_layouts() {

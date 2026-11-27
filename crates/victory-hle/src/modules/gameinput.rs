@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 pub(super) mod mouse;
+mod native;
+use native::NativeMouse;
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
@@ -118,8 +120,25 @@ trait Source: Send {
     fn desktop_pad(&mut self, keys: &[KeyState]) -> PadState {
         fallback(keys)
     }
+    /// Native input ([`native`]): what the mouse did and what the title
+    /// shows; `None` when native input is off.
+    fn native_mouse(&mut self) -> Option<NativeMouse> {
+        None
+    }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
+}
+
+/// Current readings the title has taken: what a [`native::Latch`] counts
+/// its looks by.
+static LOOKS: AtomicU64 = AtomicU64::new(0);
+
+/// Mouse sensitivity for native input's radial wheel.
+fn mouse_sensitivity() -> f32 {
+    #[cfg(windows)]
+    return mouse::sensitivity();
+    #[cfg(not(windows))]
+    1.0
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -508,6 +527,8 @@ struct State {
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    /// Native input: the mouse by what the title shows.
+    router: native::Router,
 }
 
 pub struct Hub {
@@ -555,6 +576,7 @@ impl Hub {
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                router: native::Router::default(),
             }),
             returned: Condvar::new(),
         }));
@@ -587,14 +609,14 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys, desktop) = {
+        let (pads, keys, desktop, native) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
             let keys = source.keys();
             let desktop = source.desktop_pad(&keys);
-            (pads, keys, desktop)
+            (pads, keys, desktop, source.native_mouse())
         };
-        let events = self.state().poll(&self.devices, self.one_pad, pads, keys, desktop);
+        let events = self.state().poll(&self.devices, self.one_pad, pads, keys, desktop, native);
         self.deliver(events);
     }
 
@@ -639,10 +661,20 @@ impl State {
         devices: &[Device; DEVICES],
         one_pad: bool,
         pads: [Option<PadState>; PADS],
-        keys: Vec<KeyState>,
-        desktop: PadState,
+        mut keys: Vec<KeyState>,
+        mut desktop: PadState,
+        native: Option<NativeMouse>,
     ) -> Vec<Event> {
         let now = now();
+        // Native input: the mouse's share of the stand-in pad by what the
+        // title shows, its buttons and wheel as keys of the keyboard device.
+        if let Some(mouse) = native {
+            let looks = LOOKS.load(Ordering::Relaxed);
+            let (pad, extra) =
+                self.router.route(&mouse, mouse_sensitivity(), now, looks, Instant::now());
+            desktop = merged(desktop, pad);
+            keys = native::with_keys(keys, extra);
+        }
         let mut events = std::mem::take(&mut self.pending);
         if one_pad {
             let pad = pads.into_iter().flatten().fold(desktop, merged);
@@ -788,6 +820,7 @@ extern "system" fn current_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
+    LOOKS.fetch_add(1, Ordering::Relaxed);
     let hub = hub(this);
     let state = hub.state();
     let newest = |i: usize| {
@@ -814,7 +847,13 @@ extern "system" fn current_reading(
         sequence = found.map(|r| r.sequence),
         "current reading"
     );
-    hand(out, found)
+    let stand_in = found.is_some_and(|r| std::ptr::eq(r.device, &hub.devices[FALLBACK]));
+    let hr = hand(out, found);
+    if stand_in && hr == S_OK {
+        // Native input's camera look starts each of the title's frames afresh.
+        native::note_pad_frame(now());
+    }
+    hr
 }
 
 /// The reading after (`forward`) or before `reference` on its device.
@@ -1385,8 +1424,7 @@ mod host {
             }
             down.into_iter()
                 .map(|vk| KeyState {
-                    // SAFETY: plain query.
-                    scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
+                    scan_code: vk_scan_code(vk),
                     virtual_key: vk,
                     // shortcut: no characters (code point 0);
                     // the title reads scan codes and virtual keys only.
@@ -1396,11 +1434,25 @@ mod host {
         }
 
         fn desktop_pad(&mut self, keys: &[KeyState]) -> PadState {
-            if mouse::enabled() {
+            if native::enabled() {
+                // The keys are the title's own; the mouse comes by native_mouse.
+                PadState::default()
+            } else if mouse::enabled() {
                 mouse::read(keys)
             } else {
                 fallback(keys)
             }
+        }
+
+        fn native_mouse(&mut self) -> Option<NativeMouse> {
+            use std::sync::atomic::Ordering::Relaxed;
+            use victory_loader::keyboard_events::{IN_MAP, IN_MENU, IN_WHEEL};
+            native::enabled().then(|| NativeMouse {
+                in_menu: IN_MENU.load(Relaxed),
+                in_map: IN_MAP.load(Relaxed),
+                in_wheel: IN_WHEEL.load(Relaxed),
+                ..mouse::read_native()
+            })
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1410,6 +1462,18 @@ mod host {
             };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
+        }
+    }
+
+    /// A key's scan code, with the `0xE000` prefix on the navigation keys
+    /// (Page Up/Down, End, Home, arrows, Insert, Delete): the title's keyboard
+    /// mapper tells them from the numpad's by it.
+    fn vk_scan_code(vk: u8) -> u32 {
+        // SAFETY: plain query.
+        let scan = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) };
+        match vk {
+            0x21..=0x28 | 0x2D | 0x2E => scan | 0xE000,
+            _ => scan,
         }
     }
 
@@ -1433,6 +1497,10 @@ mod host {
                     "Down" => 0x28,
                     "Left" => 0x25,
                     "Right" => 0x27,
+                    "Space" => 0x20,
+                    "LShift" => 0xA0,
+                    "LCtrl" => 0xA2,
+                    k if k.starts_with("0x") => u8::from_str_radix(&k[2..], 16).ok()?,
                     k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
                         k.as_bytes()[0].to_ascii_uppercase()
                     }
@@ -1502,6 +1570,7 @@ mod tests {
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        native: Option<NativeMouse>,
         rumble: Vec<(usize, u16, u16)>,
     }
 
@@ -1513,6 +1582,9 @@ mod tests {
         }
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
+        }
+        fn native_mouse(&mut self) -> Option<NativeMouse> {
+            self.0.lock().unwrap().native.clone()
         }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             self.0.lock().unwrap().rumble.push((slot, low, high));
@@ -1743,6 +1815,36 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+    }
+
+    /// Native input: the mouse's buttons reach the keyboard device as keys
+    /// (F13 for the left one), its look the stand-in pad's right stick.
+    #[test]
+    fn native_mouse_feeds_keyboard_keys_and_the_right_stick() {
+        let (hub, host) = fake_with(true);
+        host.lock().unwrap().native = Some(NativeMouse {
+            buttons: vec![0x01],
+            stick: (0.5, -0.5),
+            ..Default::default()
+        });
+        hub.poll();
+        let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        let state =
+            slot::<extern "system" fn(*const Reading, u32, *mut KeyState) -> u32, _>(r, 0x78);
+        let mut got = [KeyState::default(); 8];
+        assert_eq!(state(r, 8, got.as_mut_ptr()), 1);
+        assert_eq!((got[0].virtual_key, got[0].scan_code), (0x7C, 0x64));
+        release(r);
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(
+            pad(r),
+            PadState {
+                right_x: 0.5,
+                right_y: -0.5,
+                ..Default::default()
+            }
+        );
+        release(r);
     }
 
     #[test]
