@@ -76,6 +76,10 @@ pub fn run(
     drop(original);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
+    // Native keyboard & mouse relay (no-op unless VICTORY_KEYBOARD_EVENTS,
+    // VICTORY_NATIVE_KEYS, VICTORY_KEY_ACTIONS or VICTORY_KEY_BINDS is set).
+    #[cfg(windows)]
+    victory_loader::keyboard_events::start(image.base());
     println!(
         "mapped at      {:#x} (preferred {:#x})",
         image.base(),
