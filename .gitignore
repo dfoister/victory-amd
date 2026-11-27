@@ -7,6 +7,8 @@
 # See docs/asset-policy.md.
 # ---------------------------------------------------------------------------
 
+/HANDOFF.md
+
 # Build output
 /target/
 /tests/fixtures/*/target/
